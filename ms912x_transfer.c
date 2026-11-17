@@ -23,8 +23,22 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_print.h>
+#include <drm/drm_vblank.h>
+
+#ifdef MS912X_HAVE_AVX2
+#include <asm/fpu/api.h>
+#endif
 
 #include "ms912x.h"
+#include "ms912x_convert.h"
+
+void ms912x_stat_add(struct ms912x_stat *stat, u64 ns)
+{
+	stat->sum_ns += ns;
+	stat->n++;
+	if (ns > stat->max_ns)
+		stat->max_ns = ns;
+}
 
 static void ms912x_request_timeout(struct timer_list *t)
 {
@@ -33,14 +47,141 @@ static void ms912x_request_timeout(struct timer_list *t)
 	usb_sg_cancel(&request->sgr);
 }
 
+void ms912x_send_event(struct ms912x_device *ms912x,
+		       struct drm_pending_vblank_event **event)
+{
+	struct drm_device *dev = &ms912x->drm;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->event_lock, flags);
+	if (*event) {
+		drm_crtc_send_vblank_event(&ms912x->crtc, *event);
+		*event = NULL;
+		ms912x->t_last_flip = ktime_get();
+	}
+	spin_unlock_irqrestore(&dev->event_lock, flags);
+}
+
+static enum hrtimer_restart ms912x_flip_timer_fn(struct hrtimer *timer)
+{
+	struct ms912x_usb_request *request =
+		container_of(timer, struct ms912x_usb_request, flip_timer);
+
+	if (request->event)
+		request->ms912x->stats.flip_early++;
+	ms912x_send_event(request->ms912x, &request->event);
+	return HRTIMER_NORESTART;
+}
+
+#define MS912X_EWMA(avg, sample) ((avg) - ((avg) >> 3) + ((sample) >> 3))
+/* Lead samples above this are idle gaps, not render time. */
+#define MS912X_LEAD_MAX_NS (40 * NSEC_PER_MSEC)
+
+/*
+ * Just-in-time flip completion.
+ *
+ * The device has no vblank; a flip completes when we say so, and the
+ * compositor starts its next frame right after that. Completing it after
+ * the USB transfer leaves the link idle while the compositor renders,
+ * completing it early lets frames queue up behind the transfer and go
+ * stale. So predict when the transfer will finish and complete the flip
+ * one "lead" earlier, the lead being the measured time from completing a
+ * flip until the next frame has been rendered and converted. The next
+ * frame then arrives just as the link becomes free.
+ */
+static ktime_t ms912x_flip_deadline(struct ms912x_device *ms912x,
+				    struct ms912x_usb_request *request,
+				    ktime_t t_submit)
+{
+	u64 usb_ns = div_u64((u64)request->transfer_len *
+				     ms912x->usb_ps_per_byte, 1000);
+
+	return ktime_add_ns(t_submit, usb_ns) - (s64)ms912x->lead_ns;
+}
+
+static void ms912x_flip_arm(struct ms912x_device *ms912x,
+			    struct ms912x_usb_request *request,
+			    ktime_t t_submit)
+{
+	ktime_t deadline;
+
+	if (!request->event)
+		return;
+
+	switch (ms912x->flip_mode) {
+	case MS912X_FLIP_IMMEDIATE:
+		ms912x_send_event(ms912x, &request->event);
+		return;
+	case MS912X_FLIP_JIT:
+		deadline = ms912x_flip_deadline(ms912x, request, t_submit);
+		if (ktime_compare(deadline, ktime_get()) <= 0) {
+			ms912x->stats.flip_early++;
+			ms912x_send_event(ms912x, &request->event);
+		} else {
+			hrtimer_start(&request->flip_timer, deadline,
+				      HRTIMER_MODE_ABS_HARD);
+		}
+		return;
+	default:
+		return; /* sent when the transfer is done */
+	}
+}
+
+static void ms912x_update_estimates(struct ms912x_device *ms912x,
+				    struct ms912x_usb_request *request,
+				    ktime_t t_submit, ktime_t t_done)
+{
+	u64 usb_ns = ktime_to_ns(ktime_sub(t_done, t_submit));
+	u64 ps_per_byte;
+
+	/* Only large transfers say something about the link throughput. */
+	if (request->transfer_len >= 256 * 1024) {
+		ps_per_byte = div_u64(usb_ns * 1000, request->transfer_len);
+		ms912x->usb_ps_per_byte =
+			MS912X_EWMA(ms912x->usb_ps_per_byte, ps_per_byte);
+	}
+}
+
+static int ms912x_request_send(struct ms912x_usb_request *request)
+{
+	struct ms912x_device *ms912x = request->ms912x;
+	struct usb_device *usbdev = interface_to_usbdev(ms912x->intf);
+	struct usb_sg_request *sgr = &request->sgr;
+	struct sg_table *transfer_sgt = &request->transfer_sgt;
+	unsigned int maxpacket;
+	int ret, actual;
+
+	ret = usb_sg_init(sgr, usbdev, ms912x->bulk_pipe, 0, transfer_sgt->sgl,
+			  transfer_sgt->nents, request->transfer_len,
+			  GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	mod_timer(&request->timer, jiffies + msecs_to_jiffies(5000));
+	usb_sg_wait(sgr);
+
+	if (!timer_delete_sync(&request->timer))
+		return -ETIMEDOUT;
+	if (sgr->status < 0)
+		return sgr->status;
+	if (sgr->bytes != request->transfer_len)
+		return -EIO;
+
+	/* Terminate the bulk transfer like the vendor driver does. */
+	maxpacket = usb_maxpacket(usbdev, ms912x->bulk_pipe);
+	if (maxpacket && !(request->transfer_len % maxpacket))
+		usb_bulk_msg(usbdev, ms912x->bulk_pipe, NULL, 0, &actual, 100);
+
+	return 0;
+}
+
 static void ms912x_request_work(struct work_struct *work)
 {
 	struct ms912x_usb_request *request =
 		container_of(work, struct ms912x_usb_request, work);
 	struct ms912x_device *ms912x = request->ms912x;
-	struct usb_device *usbdev = interface_to_usbdev(ms912x->intf);
-	struct usb_sg_request *sgr = &request->sgr;
-	struct sg_table *transfer_sgt = &request->transfer_sgt;
+	struct ms912x_stats *stats = &ms912x->stats;
+	ktime_t t_submit, t_done;
 	int idx, ret;
 
 	if (!drm_dev_enter(&ms912x->drm, &idx)) {
@@ -48,28 +189,52 @@ static void ms912x_request_work(struct work_struct *work)
 		goto complete;
 	}
 
-	ret = usb_sg_init(sgr, usbdev, ms912x->bulk_pipe, 0, transfer_sgt->sgl,
-			  transfer_sgt->nents, request->transfer_len,
-			  GFP_KERNEL);
-	if (ret)
-		goto dev_exit;
+	t_submit = ktime_get();
+	ms912x_flip_arm(ms912x, request, t_submit);
+	ret = ms912x_request_send(request);
+	t_done = ktime_get();
+	hrtimer_cancel(&request->flip_timer);
+	if (!ret)
+		ms912x_update_estimates(ms912x, request, t_submit, t_done);
 
-	mod_timer(&request->timer, jiffies + msecs_to_jiffies(5000));
-	usb_sg_wait(sgr);
+	ms912x_stat_add(&stats->queue,
+			ktime_to_ns(ktime_sub(t_submit, request->t_queued)));
+	if (!ret) {
+		ms912x_stat_add(&stats->usb, ktime_to_ns(ktime_sub(t_done, t_submit)));
+		ms912x_stat_add(&stats->total,
+				ktime_to_ns(ktime_sub(t_done, request->t_start)));
+		stats->bytes += request->transfer_len;
+		stats->frames++;
+	} else {
+		stats->errors++;
+	}
 
-	if (!timer_delete_sync(&request->timer))
-		ret = -ETIMEDOUT;
-	else if (sgr->status < 0)
-		ret = sgr->status;
-	else if (sgr->bytes != request->transfer_len)
-		ret = -EIO;
+	if (!ret && ms912x->video_pending) {
+		/*
+		 * First (full) frame after a mode set: now turn the video
+		 * output on. The device only shows frames received after
+		 * that, and the compositor sends nothing more while the
+		 * screen is static, so send this frame again, to both of the
+		 * device's buffers.
+		 */
+		ret = ms912x_hw_start_video(ms912x);
+		if (!ret)
+			ret = ms912x_request_send(request);
+		if (!ret)
+			ret = ms912x_request_send(request);
+		if (!ret) {
+			ms912x->video_pending = false;
+			drm_info(&ms912x->drm, "video output started\n");
+		}
+	}
 
-dev_exit:
 	drm_dev_exit(idx);
 complete:
 	if (ret < 0 && ret != -ENODEV)
 		drm_err_ratelimited(&ms912x->drm,
 				    "failed to send framebuffer: %d\n", ret);
+	/* Let the compositor render the next frame now that the link is free */
+	ms912x_send_event(ms912x, &request->event);
 	complete(&request->done);
 }
 
@@ -79,6 +244,7 @@ void ms912x_free_request(struct ms912x_usb_request *request)
 		return;
 
 	timer_shutdown_sync(&request->timer);
+	hrtimer_cancel(&request->flip_timer);
 	sg_free_table(&request->transfer_sgt);
 	vfree(request->transfer_buffer);
 	request->transfer_buffer = NULL;
@@ -118,6 +284,8 @@ int ms912x_init_request(struct ms912x_device *ms912x,
 	init_completion(&request->done);
 	complete(&request->done);
 	timer_setup(&request->timer, ms912x_request_timeout, 0);
+	hrtimer_setup(&request->flip_timer, ms912x_flip_timer_fn,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_ABS_HARD);
 	INIT_WORK(&request->work, ms912x_request_work);
 	return 0;
 
@@ -126,94 +294,127 @@ err_vfree:
 	return ret;
 }
 
-static inline unsigned int ms912x_rgb_to_y(unsigned int r, unsigned int g,
-					   unsigned int b)
-{
-	const unsigned int luma = (16 << 16) + 16763 * r + 32904 * g + 6391 * b;
-
-	return luma >> 16;
-}
-
-static inline unsigned int ms912x_rgb_to_u(unsigned int r, unsigned int g,
-					   unsigned int b)
-{
-	const unsigned int u = (128 << 16) - 9676 * r - 18996 * g + 28672 * b;
-
-	return u >> 16;
-}
-
-static inline unsigned int ms912x_rgb_to_v(unsigned int r, unsigned int g,
-					   unsigned int b)
-{
-	const unsigned int v = (128 << 16) + 28672 * r - 24009 * g - 4663 * b;
-
-	return v >> 16;
-}
-
-static void ms912x_xrgb_to_yuv422_line(u8 *transfer_buffer,
-				       const struct iosys_map *xrgb_buffer,
-				       size_t offset, size_t width,
-				       __le32 *temp_buffer)
-{
-	unsigned int i, dst_offset = 0;
-	unsigned int pixel1, pixel2;
-	unsigned int r1, g1, b1, r2, g2, b2;
-	unsigned int v, y1, u, y2;
-
-	iosys_map_memcpy_from(temp_buffer, xrgb_buffer, offset, width * 4);
-	for (i = 0; i < width; i += 2) {
-		pixel1 = le32_to_cpup(&temp_buffer[i]);
-		pixel2 = le32_to_cpup(&temp_buffer[i + 1]);
-
-		r1 = (pixel1 >> 16) & 0xff;
-		g1 = (pixel1 >> 8) & 0xff;
-		b1 = pixel1 & 0xff;
-		r2 = (pixel2 >> 16) & 0xff;
-		g2 = (pixel2 >> 8) & 0xff;
-		b2 = pixel2 & 0xff;
-
-		y1 = ms912x_rgb_to_y(r1, g1, b1);
-		y2 = ms912x_rgb_to_y(r2, g2, b2);
-
-		v = (ms912x_rgb_to_v(r1, g1, b1) +
-		     ms912x_rgb_to_v(r2, g2, b2)) /
-		    2;
-		u = (ms912x_rgb_to_u(r1, g1, b1) +
-		     ms912x_rgb_to_u(r2, g2, b2)) /
-		    2;
-
-		transfer_buffer[dst_offset++] = u;
-		transfer_buffer[dst_offset++] = y1;
-		transfer_buffer[dst_offset++] = v;
-		transfer_buffer[dst_offset++] = y2;
-	}
-}
-
 static const u8 ms912x_end_of_buffer[] = { 0xff, 0xc0, 0x00, 0x00,
 				    0x00, 0x00, 0x00, 0x00 };
 
-static int ms912x_fb_xrgb8888_to_yuv422(void *dst,
+#define MS912X_FPU_LINES 16
+#define MS912X_MAX_CONV_THREADS 8
+/* Below this many pixels the thread hand-off costs more than it saves. */
+#define MS912X_MT_MIN_PIXELS (256 * 1024)
+
+struct ms912x_conv_job {
+	struct work_struct work;
+	struct completion done;
+	u8 *dst;
+	const u8 *src;
+	unsigned int pitch;
+	unsigned int width;
+	unsigned int lines;
+	bool avx2;
+};
+
+static void ms912x_convert_lines(u8 *dst, const u8 *src, unsigned int pitch,
+				 unsigned int width, unsigned int lines,
+				 bool avx2)
+{
+	unsigned int i;
+
+	for (i = 0; i < lines; i++) {
+#ifdef MS912X_HAVE_AVX2
+		if (avx2) {
+			/* Keep non-preemptible sections short. */
+			if (!(i % MS912X_FPU_LINES))
+				kernel_fpu_begin();
+			ms912x_xrgb_to_uyvy_avx2(dst, (const u32 *)src, width);
+			if (i % MS912X_FPU_LINES == MS912X_FPU_LINES - 1 ||
+			    i == lines - 1)
+				kernel_fpu_end();
+		} else
+#endif
+			ms912x_xrgb_to_uyvy_c(dst, (const u32 *)src, width);
+		dst += width * 2;
+		src += pitch;
+	}
+}
+
+static void ms912x_conv_work(struct work_struct *work)
+{
+	struct ms912x_conv_job *job =
+		container_of(work, struct ms912x_conv_job, work);
+
+	ms912x_convert_lines(job->dst, job->src, job->pitch, job->width,
+			     job->lines, job->avx2);
+	complete(&job->done);
+}
+
+/* Convert a system memory region, split across worker threads. */
+static void ms912x_convert_parallel(struct ms912x_device *ms912x, u8 *dst,
+				    const u8 *src, unsigned int pitch,
+				    unsigned int width, unsigned int lines,
+				    bool avx2)
+{
+	struct ms912x_conv_job jobs[MS912X_MAX_CONV_THREADS];
+	unsigned int n = ms912x->conv_threads, i, line = 0, per;
+
+	if (n > 1 && ms912x->conv_workqueue &&
+	    width * lines >= MS912X_MT_MIN_PIXELS) {
+		n = min_t(unsigned int, n, lines / 8);
+	} else {
+		n = 1;
+	}
+
+	if (n <= 1) {
+		ms912x_convert_lines(dst, src, pitch, width, lines, avx2);
+		return;
+	}
+
+	per = DIV_ROUND_UP(lines, n);
+	for (i = 0; i < n; i++) {
+		struct ms912x_conv_job *job = &jobs[i];
+		unsigned int count = min(per, lines - line);
+
+		job->dst = dst + (size_t)line * width * 2;
+		job->src = src + (size_t)line * pitch;
+		job->pitch = pitch;
+		job->width = width;
+		job->lines = count;
+		job->avx2 = avx2;
+		line += count;
+
+		/* Band 0 runs on this thread. */
+		if (i) {
+			INIT_WORK_ONSTACK(&job->work, ms912x_conv_work);
+			init_completion(&job->done);
+			queue_work(ms912x->conv_workqueue, &job->work);
+		}
+	}
+
+	ms912x_convert_lines(jobs[0].dst, jobs[0].src, pitch, width,
+			     jobs[0].lines, avx2);
+
+	for (i = 1; i < n; i++) {
+		wait_for_completion(&jobs[i].done);
+		destroy_work_on_stack(&jobs[i].work);
+	}
+}
+
+static int ms912x_fb_xrgb8888_to_yuv422(struct ms912x_device *ms912x,
+					void *dst,
 					const struct iosys_map *src,
 					struct drm_framebuffer *fb,
 					const struct drm_rect *rect,
 					struct drm_format_conv_state *fmtcnv_state)
 {
 	struct ms912x_frame_update_header *header = dst;
-	struct iosys_map fb_map;
+	unsigned int pitch = fb->pitches[0];
 	u32 position, dimensions;
 	int i, x, y1, y2, width;
-	__le32 *temp_buffer;
+	bool avx2 = false;
 
 	y1 = rect->y1;
 	y2 = min_t(unsigned int, rect->y2, fb->height);
 	x = rect->x1;
 	width = drm_rect_width(rect);
-
-	temp_buffer = drm_format_conv_state_reserve(fmtcnv_state,
-						    width * sizeof(*temp_buffer),
-						    GFP_KERNEL);
-	if (!temp_buffer)
-		return -ENOMEM;
 
 	header->marker = cpu_to_be16(0xff00);
 	position = ((x & 0xfff) << 12) | (y1 & 0xfff);
@@ -223,33 +424,67 @@ static int ms912x_fb_xrgb8888_to_yuv422(void *dst,
 	put_unaligned_be24(dimensions, header->dimensions);
 	dst += sizeof(*header);
 
-	fb_map = IOSYS_MAP_INIT_OFFSET(src, y1 * fb->pitches[0]);
-	for (i = y1; i < y2; i++) {
-		ms912x_xrgb_to_yuv422_line(dst, &fb_map, x * 4, width,
-					   temp_buffer);
-		iosys_map_incr(&fb_map, fb->pitches[0]);
-		dst += width * 2;
+#ifdef MS912X_HAVE_AVX2
+	avx2 = ms912x->use_avx2;
+#endif
+
+	if (!src->is_iomem) {
+		ms912x_convert_parallel(ms912x, dst,
+					(const u8 *)src->vaddr + y1 * pitch + x * 4,
+					pitch, width, y2 - y1, avx2);
+		dst += (size_t)width * 2 * (y2 - y1);
+	} else {
+		u32 *temp_buffer;
+
+		temp_buffer = drm_format_conv_state_reserve(fmtcnv_state,
+							    width * sizeof(u32),
+							    GFP_KERNEL);
+		if (!temp_buffer)
+			return -ENOMEM;
+
+		for (i = y1; i < y2; i++) {
+			struct iosys_map map =
+				IOSYS_MAP_INIT_OFFSET(src, i * pitch + x * 4);
+
+			iosys_map_memcpy_from(temp_buffer, &map, 0, width * 4);
+			ms912x_convert_lines(dst, (const u8 *)temp_buffer, 0,
+					     width, 1, avx2);
+			dst += width * 2;
+		}
 	}
 
 	memcpy(dst, ms912x_end_of_buffer, sizeof(ms912x_end_of_buffer));
 	return 0;
 }
 
+/*
+ * Convert and queue @rect of @fb. If @event is non-NULL and the frame is
+ * queued, the event is taken over and sent once the USB transfer is done;
+ * otherwise it is left for the caller.
+ */
 int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
 			struct drm_format_conv_state *fmtcnv_state,
-			struct drm_rect *rect)
+			struct drm_rect *rect,
+			struct drm_pending_vblank_event **event)
 {
 	int ret = 0, idx;
 	struct ms912x_device *ms912x = to_ms912x(fb->dev);
 	struct drm_device *drm = &ms912x->drm;
+	struct ms912x_stats *stats = &ms912x->stats;
 	struct ms912x_usb_request *current_request;
-	int x, width;
+	ktime_t t0, t1, t2;
 
-	/* UYVY stores pixels in pairs. Expand damage to a complete pair. */
-	x = ALIGN_DOWN(rect->x1, 2);
-	width = min_t(int, ALIGN(rect->x2, 2), fb->width) - x;
-	rect->x1 = x;
-	rect->x2 = x + width;
+	/*
+	 * Block alignment used by the vendor driver: x in units of 4 pixels,
+	 * y in units of 2 lines.
+	 */
+	rect->x1 = ALIGN_DOWN(rect->x1, 4);
+	rect->x2 = min_t(int, ALIGN(rect->x2, 4), ALIGN_DOWN(fb->width, 2));
+	rect->y1 = ALIGN_DOWN(rect->y1, 2);
+	rect->y2 = min_t(int, ALIGN(rect->y2, 2), fb->height);
+	if (rect->x2 <= rect->x1 || rect->y2 <= rect->y1)
+		return 0;
+
 	current_request = &ms912x->requests[ms912x->current_request];
 
 	if (!drm_dev_enter(drm, &idx))
@@ -258,25 +493,55 @@ int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
 	/* Transfer buffer still in use, drop this frame. */
 	if (!wait_for_completion_timeout(&current_request->done,
 					 msecs_to_jiffies(10))) {
+		stats->dropped++;
 		ret = -ETIMEDOUT;
 		goto dev_exit;
 	}
 
+	t0 = ktime_get();
 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
 	if (ret < 0)
 		goto request_complete;
+	t1 = ktime_get();
 
-	ret = ms912x_fb_xrgb8888_to_yuv422(current_request->transfer_buffer,
+	ret = ms912x_fb_xrgb8888_to_yuv422(ms912x,
+					   current_request->transfer_buffer,
 					   map, fb, rect, fmtcnv_state);
 
 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
 	if (ret < 0)
 		goto request_complete;
+	t2 = ktime_get();
 
+	ms912x_stat_add(&stats->cpu_access, ktime_to_ns(ktime_sub(t1, t0)));
+	ms912x_stat_add(&stats->convert, ktime_to_ns(ktime_sub(t2, t1)));
+	if (drm_rect_width(rect) == fb->width && drm_rect_height(rect) == fb->height)
+		stats->full_frames++;
+
+	/* Time from the last flip until this frame was ready to send */
+	if (event && *event && ms912x->t_last_flip) {
+		u64 lead = ktime_to_ns(ktime_sub(t2, ms912x->t_last_flip));
+
+		if (lead < MS912X_LEAD_MAX_NS) {
+			ms912x->lead_ns = MS912X_EWMA(ms912x->lead_ns, lead);
+			ms912x_stat_add(&stats->lead, lead);
+		}
+	}
+
+	current_request->t_start = t0;
+	current_request->t_queued = t2;
+	if (event) {
+		current_request->event = *event;
+		*event = NULL;
+	}
 	current_request->transfer_len =
-		width * 2 * drm_rect_height(rect) + MS912X_FRAME_OVERHEAD;
+		drm_rect_width(rect) * 2 * drm_rect_height(rect) +
+		MS912X_FRAME_OVERHEAD;
 	queue_work(ms912x->workqueue, &current_request->work);
 	ms912x->current_request = 1 - ms912x->current_request;
+
+	WRITE_ONCE(ms912x->last_request, current_request);
+	ms912x_keepalive_arm(ms912x);
 	goto dev_exit;
 
 request_complete:
@@ -284,4 +549,100 @@ request_complete:
 dev_exit:
 	drm_dev_exit(idx);
 	return ret;
+}
+
+/* Module parameters, defined in ms912x_drv.c */
+
+void ms912x_keepalive_arm(struct ms912x_device *ms912x)
+{
+	if (ms912x_keepalive_ms)
+		mod_delayed_work(ms912x->workqueue, &ms912x->keepalive_work,
+				 msecs_to_jiffies(ms912x_keepalive_ms));
+}
+
+/*
+ * Runs on the ordered transfer workqueue, so it never overlaps a frame
+ * transfer. The last request's buffer is only rewritten two frames later,
+ * which cannot start before the next frame's transfer (queued behind this
+ * work) has completed its flip.
+ */
+void ms912x_keepalive_work(struct work_struct *work)
+{
+	struct ms912x_device *ms912x = container_of(to_delayed_work(work),
+						    struct ms912x_device,
+						    keepalive_work);
+	struct ms912x_usb_request *request = READ_ONCE(ms912x->last_request);
+	int idx, ret;
+
+	if (!request || ms912x->video_pending || ms912x_debug_hold ||
+	    !ms912x_keepalive_ms)
+		return;
+	if (!drm_dev_enter(&ms912x->drm, &idx))
+		return;
+
+	ret = ms912x_request_send(request);
+	drm_dev_exit(idx);
+
+	if (ret)
+		drm_dbg(&ms912x->drm, "keepalive failed: %d\n", ret);
+	else
+		ms912x->keepalives++;
+
+	ms912x_keepalive_arm(ms912x);
+}
+
+/*
+ * Test hook: immediately send a full frame of one color, bypassing the
+ * compositor. Used to measure device + display latency. Returns the
+ * monotonic time at which the transfer completed in *t_done_ns.
+ */
+int ms912x_send_fill(struct ms912x_device *ms912x, unsigned int width,
+		     unsigned int height, u32 rgb, u64 *t_done_ns)
+{
+	struct ms912x_usb_request *request;
+	struct ms912x_frame_update_header *header;
+	u32 pixel[2] = { rgb, rgb };
+	u8 uyvy[4], *dst;
+	size_t i, n;
+
+	if (!width || width > MS912X_MAX_WIDTH || !height ||
+	    height > MS912X_MAX_HEIGHT)
+		return -EINVAL;
+	ms912x_xrgb_to_uyvy_c(uyvy, pixel, 2);
+
+	request = &ms912x->requests[ms912x->current_request];
+	if (!wait_for_completion_timeout(&request->done,
+					 msecs_to_jiffies(1000)))
+		return -ETIMEDOUT;
+
+	header = request->transfer_buffer;
+	header->marker = cpu_to_be16(0xff00);
+	put_unaligned_be24(0, header->position);
+	put_unaligned_be24(((width & 0xfff) << 12) | (height & 0xfff),
+			   header->dimensions);
+	dst = request->transfer_buffer + sizeof(*header);
+	n = (size_t)width * height / 2;
+	for (i = 0; i < n; i++, dst += 4)
+		memcpy(dst, uyvy, 4);
+	memcpy(dst, ms912x_end_of_buffer, sizeof(ms912x_end_of_buffer));
+
+	request->event = NULL;
+	WRITE_ONCE(ms912x->last_request, NULL);
+	request->t_start = request->t_queued = ktime_get();
+	request->transfer_len = (size_t)width * height * 2 +
+				MS912X_FRAME_OVERHEAD;
+	queue_work(ms912x->workqueue, &request->work);
+	ms912x->current_request = 1 - ms912x->current_request;
+
+	if (!wait_for_completion_timeout(&request->done,
+					 msecs_to_jiffies(1000)))
+		return -ETIMEDOUT;
+	/* Make the next compositor frame a full update. */
+	ms912x->update_rect.x1 = 0;
+	ms912x->update_rect.y1 = 0;
+	ms912x->update_rect.x2 = width;
+	ms912x->update_rect.y2 = height;
+	*t_done_ns = ktime_get_ns();
+	complete(&request->done);
+	return 0;
 }

@@ -25,7 +25,45 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_print.h>
 
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+
+#include <drm/drm_debugfs.h>
+#include <drm/drm_modeset_lock.h>
+
+#ifdef MS912X_HAVE_AVX2
+#include <asm/cpufeature.h>
+#endif
+
 #include "ms912x.h"
+
+static bool use_avx2 = true;
+module_param(use_avx2, bool, 0444);
+MODULE_PARM_DESC(use_avx2, "Use AVX2 for RGB to YUV conversion when available (default: true)");
+
+static uint flip_mode = MS912X_FLIP_JIT;
+module_param(flip_mode, uint, 0644);
+MODULE_PARM_DESC(flip_mode,
+		 "When to complete page flips: 0 = after conversion (max throughput), 1 = after the USB transfer, 2 = just in time for the next frame (lowest latency, default)");
+
+static uint conv_threads;
+module_param(conv_threads, uint, 0444);
+MODULE_PARM_DESC(conv_threads,
+		 "Threads for RGB to YUV conversion, 0 = auto (default)");
+
+uint ms912x_keepalive_ms = 1000;
+module_param_named(keepalive_ms, ms912x_keepalive_ms, uint, 0644);
+MODULE_PARM_DESC(keepalive_ms,
+		 "Resend the image after this many ms without updates; the device turns its output off without frames (0 = off, default: 1000)");
+
+bool ms912x_debug_hold;
+module_param_named(debug_hold, ms912x_debug_hold, bool, 0644);
+MODULE_PARM_DESC(debug_hold, "Debug: ignore compositor frames (for latency tests)");
+
+static uint trans_mode = MS912X_TRANS_MODE_MANUAL_BLOCK;
+module_param(trans_mode, uint, 0644);
+MODULE_PARM_DESC(trans_mode,
+		 "Device transfer mode applied at mode set: 3 = double buffered (default), 5 = bypass/single buffered");
 
 static int ms912x_usb_suspend(struct usb_interface *interface,
 			      pm_message_t message)
@@ -44,7 +82,18 @@ static int ms912x_usb_resume(struct usb_interface *interface)
 
 DEFINE_DRM_GEM_FOPS(ms912x_driver_fops);
 
-static const struct drm_driver ms912x_drm_driver = {
+/*
+ * wlroots/aquamarine based compositors (Hyprland) only drive render-less
+ * USB KMS devices when the DRM driver identifies itself as "evdi": they
+ * then scan out the primary GPU's (linear) buffers directly via PRIME
+ * instead of trying to create an EGL renderer on this device, which fails.
+ */
+static bool evdi_compat = true;
+module_param(evdi_compat, bool, 0444);
+MODULE_PARM_DESC(evdi_compat,
+		 "Report DRM driver name as \"evdi\" for compositor compatibility (default: true)");
+
+static struct drm_driver ms912x_drm_driver = {
 	.driver_features = DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
 
 	/* GEM hooks */
@@ -138,19 +187,17 @@ static void ms912x_crtc_atomic_enable(struct drm_crtc *crtc,
 	const struct ms912x_mode *ms_mode;
 	int ret;
 
-	ret = ms912x_power_on(ms912x);
-	if (ret) {
-		drm_err(dev, "failed to power on display: %d\n", ret);
-		return;
-	}
-
 	ms_mode = ms912x_get_mode(ms912x, &crtc_state->mode);
 	if (!ms_mode) {
 		drm_err(dev, "unsupported mode passed to CRTC enable\n");
 		return;
 	}
 
-	ret = ms912x_set_resolution(ms912x, ms_mode);
+	drm_info(dev, "mode set %dx%d@%d (vic 0x%02x)\n", ms_mode->width,
+		 ms_mode->height, ms_mode->hz, ms_mode->mode);
+	ms912x->video_pending = true;
+	WRITE_ONCE(ms912x->last_request, NULL);
+	ret = ms912x_hw_enable(ms912x, ms_mode, trans_mode);
 	if (ret)
 		drm_err(dev, "failed to set display mode: %d\n", ret);
 }
@@ -162,8 +209,11 @@ static void ms912x_cancel_transfer_work(struct ms912x_device *ms912x)
 	for (i = 0; i < ARRAY_SIZE(ms912x->requests); i++) {
 		struct ms912x_usb_request *request = &ms912x->requests[i];
 
-		if (cancel_work_sync(&request->work))
+		if (cancel_work_sync(&request->work)) {
+			hrtimer_cancel(&request->flip_timer);
+			ms912x_send_event(ms912x, &request->event);
 			complete(&request->done);
+		}
 	}
 }
 
@@ -174,8 +224,10 @@ static void ms912x_crtc_atomic_disable(struct drm_crtc *crtc,
 	struct ms912x_device *ms912x = to_ms912x(dev);
 	int ret;
 
+	drm_info(dev, "output disabled\n");
+	cancel_delayed_work_sync(&ms912x->keepalive_work);
 	ms912x_cancel_transfer_work(ms912x);
-	ret = ms912x_power_off(ms912x);
+	ret = ms912x_hw_disable(ms912x);
 	if (ret && ret != -ENODEV)
 		drm_err(dev, "failed to power off display: %d\n", ret);
 }
@@ -209,9 +261,18 @@ static int ms912x_plane_atomic_check(struct drm_plane *plane,
 	/*
 	 * A mode set does change how the device interprets the framebuffer
 	 * so ask for a full plane update for the first frame after one.
+	 *
+	 * A plain framebuffer switch does not: the device keeps its own copy
+	 * of the image, and damage clips describe the change relative to the
+	 * previously displayed frame even when compositors flip between
+	 * swapchain buffers (which they do on every frame). Only fall back
+	 * to a full update when the new framebuffer has a different layout.
 	 */
 	new_plane_state->ignore_damage_clips =
-		old_plane_state->fb != new_plane_state->fb ||
+		!old_plane_state->fb || !new_plane_state->fb ||
+		old_plane_state->fb->format != new_plane_state->fb->format ||
+		old_plane_state->fb->width != new_plane_state->fb->width ||
+		old_plane_state->fb->height != new_plane_state->fb->height ||
 		(crtc_state && drm_atomic_crtc_needs_modeset(crtc_state));
 
 	return drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
@@ -246,6 +307,7 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
 	struct drm_shadow_plane_state *shadow_plane_state;
 	struct ms912x_device *ms912x = to_ms912x(plane->dev);
 	struct drm_rect current_rect, rect;
+	int ret;
 
 	old_plane_state = drm_atomic_get_old_plane_state(state, plane);
 	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
@@ -260,17 +322,38 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
 	if (drm_atomic_crtc_needs_modeset(new_crtc_state))
 		ms912x_clear_rect(&ms912x->update_rect);
 
+	if (ms912x_debug_hold)
+		return;
+
 	if (drm_atomic_helper_damage_merged(old_plane_state, new_plane_state,
 					    &current_rect)) {
+		struct drm_pending_vblank_event *event = NULL;
+
+		/*
+		 * Take over the flip event: depending on flip_mode it is
+		 * completed after conversion, after the USB transfer, or just
+		 * in time for the next frame (see ms912x_flip_deadline()).
+		 */
+		ms912x->flip_mode = min_t(uint, flip_mode, MS912X_FLIP_JIT);
+		if (new_crtc_state->event) {
+			spin_lock_irq(&plane->dev->event_lock);
+			event = new_crtc_state->event;
+			new_crtc_state->event = NULL;
+			spin_unlock_irq(&plane->dev->event_lock);
+		}
+
 		/*
 		 * The device double buffers, so we need to send the update
 		 * rects of the last two frames.
 		 */
 		ms912x_merge_rects(&rect, &current_rect, &ms912x->update_rect);
-		if (ms912x_fb_send_rect(new_plane_state->fb,
-					&shadow_plane_state->data[0],
-					&shadow_plane_state->fmtcnv_state,
-					&rect)) {
+		ret = ms912x_fb_send_rect(new_plane_state->fb,
+					  &shadow_plane_state->data[0],
+					  &shadow_plane_state->fmtcnv_state,
+					  &rect, &event);
+		/* Not queued: complete the flip now. */
+		ms912x_send_event(ms912x, &event);
+		if (ret) {
 			/* In case of error, merge the rects to update later */
 			ms912x_merge_rects(&ms912x->update_rect,
 					   &ms912x->update_rect, &rect);
@@ -279,6 +362,100 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
 		}
 	}
 }
+
+static void ms912x_stat_show(struct seq_file *m, const char *name,
+			     struct ms912x_stat *stat)
+{
+	u64 avg = stat->n ? div_u64(stat->sum_ns, stat->n) : 0;
+
+	seq_printf(m, "%-11s n=%-6u avg=%6llu.%03llu ms  max=%6llu.%03llu ms\n",
+		   name, stat->n, avg / 1000000, (avg / 1000) % 1000,
+		   stat->max_ns / 1000000, (stat->max_ns / 1000) % 1000);
+	memset(stat, 0, sizeof(*stat));
+}
+
+/* Statistics since the last read; reading resets them. */
+static int ms912x_debugfs_stats(struct seq_file *m, void *data)
+{
+	struct drm_debugfs_entry *entry = m->private;
+	struct ms912x_device *ms912x = to_ms912x(entry->dev);
+	struct ms912x_stats *stats = &ms912x->stats;
+
+	seq_printf(m, "chip=%s port=%d avx2=%d threads=%u flip_mode=%u trans_mode=%u video_pending=%d\n",
+		   ms912x->is_913x ? "ms913x" : "ms912x", ms912x->port_type,
+		   ms912x->use_avx2, ms912x->conv_threads, ms912x->flip_mode,
+		   trans_mode, ms912x->video_pending);
+	seq_printf(m, "lead_est=%llu.%03llu ms usb_est=%llu ps/byte flip_early=%u\n",
+		   ms912x->lead_ns / 1000000, (ms912x->lead_ns / 1000) % 1000,
+		   ms912x->usb_ps_per_byte, stats->flip_early);
+	seq_printf(m, "frames=%u full=%u dropped=%u errors=%u bytes=%llu keepalives=%u\n",
+		   stats->frames, stats->full_frames, stats->dropped,
+		   stats->errors, stats->bytes, ms912x->keepalives);
+	ms912x_stat_show(m, "cpu_access", &stats->cpu_access);
+	ms912x_stat_show(m, "convert", &stats->convert);
+	ms912x_stat_show(m, "queue", &stats->queue);
+	ms912x_stat_show(m, "usb", &stats->usb);
+	ms912x_stat_show(m, "total", &stats->total);
+	ms912x_stat_show(m, "lead", &stats->lead);
+	stats->flip_early = 0;
+	stats->frames = stats->full_frames = stats->dropped = stats->errors = 0;
+	stats->bytes = 0;
+	return 0;
+}
+
+/*
+ * Debug: "echo RRGGBB > ms912x_fill" sends a solid full frame right away;
+ * reading returns the CLOCK_MONOTONIC ns at which the last one completed.
+ */
+static u64 ms912x_fill_done_ns;
+
+static int ms912x_fill_show(struct seq_file *m, void *data)
+{
+	seq_printf(m, "%llu\n", ms912x_fill_done_ns);
+	return 0;
+}
+
+static int ms912x_fill_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ms912x_fill_show, inode->i_private);
+}
+
+static ssize_t ms912x_fill_write(struct file *file, const char __user *ubuf,
+				 size_t len, loff_t *offp)
+{
+	struct seq_file *m = file->private_data;
+	struct ms912x_device *ms912x = m->private;
+	struct drm_crtc_state *crtc_state;
+	unsigned int w, h;
+	u32 rgb;
+	int ret;
+
+	ret = kstrtou32_from_user(ubuf, len, 16, &rgb);
+	if (ret)
+		return ret;
+
+	drm_modeset_lock(&ms912x->crtc.mutex, NULL);
+	crtc_state = ms912x->crtc.state;
+	if (!crtc_state || !crtc_state->active) {
+		drm_modeset_unlock(&ms912x->crtc.mutex);
+		return -EINVAL;
+	}
+	w = crtc_state->mode.hdisplay;
+	h = crtc_state->mode.vdisplay;
+	ret = ms912x_send_fill(ms912x, w, h, rgb, &ms912x_fill_done_ns);
+	drm_modeset_unlock(&ms912x->crtc.mutex);
+
+	return ret ? ret : len;
+}
+
+static const struct file_operations ms912x_fill_fops = {
+	.owner = THIS_MODULE,
+	.open = ms912x_fill_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.write = ms912x_fill_write,
+};
 
 static const struct drm_crtc_helper_funcs ms912x_crtc_helper_funcs = {
 	.mode_valid = ms912x_crtc_mode_valid,
@@ -317,6 +494,11 @@ static const u8 ms912x_bulk_out_endpoints[] = {
 	MS912X_BULK_OUT_ENDPOINT, 0
 };
 
+static void ms912x_destroy_conv_wq(struct drm_device *dev, void *ptr)
+{
+	destroy_workqueue(ptr);
+}
+
 static int ms912x_usb_probe(struct usb_interface *interface,
 			    const struct usb_device_id *id)
 {
@@ -326,6 +508,9 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 	struct drm_device *dev;
 	struct device *dma_dev;
 	struct usb_device *usbdev;
+
+	if (evdi_compat)
+		ms912x_drm_driver.name = "evdi";
 
 	ms912x = devm_drm_dev_alloc(&interface->dev, &ms912x_drm_driver,
 				    struct ms912x_device, drm);
@@ -339,6 +524,15 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 
 	if (!usb_check_bulk_endpoints(interface, ms912x_bulk_out_endpoints))
 		return -ENXIO;
+
+	ret = ms912x_detect_chip(ms912x);
+	if (ret)
+		drm_warn(&ms912x->drm, "failed to read chip id: %d\n", ret);
+
+#ifdef MS912X_HAVE_AVX2
+	ms912x->use_avx2 = use_avx2 && boot_cpu_has(X86_FEATURE_AVX2) &&
+			   boot_cpu_has(X86_FEATURE_OSXSAVE);
+#endif
 
 	ret = ms912x_read_custom_timing(ms912x);
 	if (ret < 0) {
@@ -383,9 +577,27 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 		return ret;
 
 	ms912x->workqueue =
-		drmm_alloc_ordered_workqueue(dev, DRIVER_NAME, 0);
+		drmm_alloc_ordered_workqueue(dev, DRIVER_NAME, WQ_HIGHPRI);
 	if (IS_ERR(ms912x->workqueue))
 		return PTR_ERR(ms912x->workqueue);
+
+	/* Initial estimates, refined at runtime */
+	ms912x->usb_ps_per_byte = 2700;
+	ms912x->lead_ns = 8 * NSEC_PER_MSEC;
+
+	ms912x->conv_threads = conv_threads ? conv_threads :
+			       min(4U, num_online_cpus());
+	ms912x->conv_threads = min(ms912x->conv_threads, 8U);
+	if (ms912x->conv_threads > 1) {
+		ms912x->conv_workqueue =
+			alloc_workqueue("ms912x-conv", WQ_UNBOUND | WQ_HIGHPRI, 0);
+		if (!ms912x->conv_workqueue)
+			return -ENOMEM;
+		ret = drmm_add_action_or_reset(dev, ms912x_destroy_conv_wq,
+					       ms912x->conv_workqueue);
+		if (ret)
+			return ret;
+	}
 
 	ret = ms912x_init_request(ms912x, &ms912x->requests[0],
 				  MS912X_MAX_TRANSFER_LEN);
@@ -396,6 +608,8 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 				  MS912X_MAX_TRANSFER_LEN);
 	if (ret)
 		goto err_free_request_0;
+
+	INIT_DELAYED_WORK(&ms912x->keepalive_work, ms912x_keepalive_work);
 
 	ret = drm_universal_plane_init(dev, &ms912x->plane, 0,
 				       &ms912x_plane_funcs,
@@ -426,9 +640,15 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 
 	drmm_kms_helper_poll_init(dev);
 
+	drm_debugfs_add_file(dev, "ms912x_stats", ms912x_debugfs_stats, NULL);
+
 	ret = drm_dev_register(dev, 0);
 	if (ret)
 		goto err_free_request_1;
+
+	if (dev->debugfs_root)
+		debugfs_create_file("ms912x_fill", 0600, dev->debugfs_root,
+				    ms912x, &ms912x_fill_fops);
 
 	drm_client_setup(dev, NULL);
 
@@ -448,6 +668,7 @@ static void ms912x_usb_disconnect(struct usb_interface *interface)
 
 	drm_dev_unplug(dev);
 	drm_atomic_helper_shutdown(dev);
+	cancel_delayed_work_sync(&ms912x->keepalive_work);
 	ms912x_cancel_transfer_work(ms912x);
 	ms912x_free_request(&ms912x->requests[0]);
 	ms912x_free_request(&ms912x->requests[1]);

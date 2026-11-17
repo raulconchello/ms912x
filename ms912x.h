@@ -5,6 +5,8 @@
 
 #include <linux/bits.h>
 #include <linux/completion.h>
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/timer_types.h>
@@ -32,6 +34,7 @@
 
 #define MS912X_REQ_TYPE_WRITE_6_BYTES	0xa6
 #define MS912X_REQ_TYPE_READ_BYTE	0xb5
+#define MS912X_REQ_TYPE_WRITE_BYTE	0xb6
 #define MS912X_REQ_TYPE_READ_FLASH	0xf5
 
 #define MS912X_REG_VIDEO_PORT		0x0031
@@ -42,12 +45,18 @@
 #define MS912X_REG_MODE_SEQUENCE_1	0x0033
 #define MS912X_REG_MODE_SEQUENCE_2	0xc620
 
-#define MS912X_CMD_RESOLUTION		0x01
-#define MS912X_CMD_MODE			0x02
-#define MS912X_CMD_UNKNOWN1		0x03
-#define MS912X_CMD_UNKNOWN2		0x04
-#define MS912X_CMD_OUTPUT_ENABLE	0x05
+/* Video sub-commands, names from the MacroSilicon vendor driver */
+#define MS912X_CMD_RESOLUTION		0x01 /* video in info */
+#define MS912X_CMD_MODE			0x02 /* video out info */
+#define MS912X_CMD_UNKNOWN1		0x03 /* transfer mode */
+#define MS912X_CMD_UNKNOWN2		0x04 /* transfer enable */
+#define MS912X_CMD_OUTPUT_ENABLE	0x05 /* video enable */
 #define MS912X_CMD_POWER		0x07
+
+#define MS912X_TRANS_MODE_FRAME			0
+#define MS912X_TRANS_MODE_MANUAL_BLOCK		3
+#define MS912X_TRANS_MODE_BYPASS_FRAME		4
+#define MS912X_TRANS_MODE_BYPASS_MANUAL_BLOCK	5
 
 #define MS913X_REG_CHIP_ID			0xff00
 #define MS912X_REG_CHIP_ID			0xf000
@@ -74,8 +83,15 @@ enum ms912x_video_port {
 	MS912X_VIDEO_PORT_UNKNOWN = 0xff,
 };
 
+struct drm_pending_vblank_event;
+
 struct ms912x_usb_request {
 	void *transfer_buffer;
+	/* flip event completed when this transfer is done (may be NULL) */
+	struct drm_pending_vblank_event *event;
+	ktime_t t_start; /* conversion start, for latency stats */
+	ktime_t t_queued; /* conversion done */
+	struct hrtimer flip_timer; /* just-in-time flip completion */
 	struct ms912x_device *ms912x;
 	size_t transfer_len;
 	struct sg_table transfer_sgt;
@@ -101,6 +117,33 @@ struct ms912x_custom_mode {
 #define MS912X_PIXFMT_UYVY		0x22
 #define MS912X_BYTE_SELECT_UYVY		0x00
 
+struct ms912x_stat {
+	u64 sum_ns;
+	u64 max_ns;
+	u32 n;
+};
+
+enum ms912x_flip_mode {
+	MS912X_FLIP_IMMEDIATE = 0,	/* after conversion: max throughput */
+	MS912X_FLIP_ON_DONE = 1,	/* after the USB transfer */
+	MS912X_FLIP_JIT = 2,		/* predicted, see ms912x_flip_deadline() */
+};
+
+struct ms912x_stats {
+	struct ms912x_stat cpu_access;	/* begin_cpu_access (fence wait/flush) */
+	struct ms912x_stat convert;	/* XRGB -> UYVY */
+	struct ms912x_stat queue;	/* conversion done -> USB submit */
+	struct ms912x_stat usb;		/* USB bulk transfer */
+	struct ms912x_stat total;	/* conversion start -> USB done */
+	struct ms912x_stat lead;	/* flip event -> next frame converted */
+	u32 flip_early;			/* flips completed before USB done */
+	u64 bytes;
+	u32 frames;
+	u32 full_frames;
+	u32 dropped;
+	u32 errors;
+};
+
 #define MS912X_MODE(w, h, z, m)                                               \
 	{                                                                      \
 		.width = w, .height = h, .hz = z, .mode = m                    \
@@ -111,7 +154,29 @@ struct ms912x_device {
 	struct usb_interface *intf;
 	unsigned int bulk_pipe;
 	enum ms912x_video_port port_type;
+	bool is_913x;		/* MS9132/MS9133/MS9135 register layout */
+	bool video_pending;	/* video output enabled after first frame */
+	bool use_avx2;
+	struct ms912x_stats stats;
+
+	/*
+	 * Keepalive: the device turns its video output off when it receives
+	 * no frames for a few seconds, so resend the last transfer when the
+	 * screen is idle. That transfer carries the damage of the last two
+	 * frames, so it brings either of the device's buffers up to date.
+	 */
+	struct ms912x_usb_request *last_request;
+	struct delayed_work keepalive_work;
+	u32 keepalives;
+
+	/* Just-in-time flip pacing state */
+	unsigned int flip_mode;
+	ktime_t t_last_flip;	/* when the last flip event was sent */
+	u64 lead_ns;		/* EWMA: flip event -> next frame ready to send */
+	u64 usb_ps_per_byte;	/* EWMA: USB transfer cost, picoseconds/byte */
 	struct workqueue_struct *workqueue;
+	struct workqueue_struct *conv_workqueue;
+	unsigned int conv_threads;
 	/* Serializes HID control request/response sequences */
 	struct mutex ctrl_lock;
 
@@ -201,10 +266,26 @@ int ms912x_set_resolution(struct ms912x_device *ms912x,
 
 int ms912x_power_on(struct ms912x_device *ms912x);
 int ms912x_power_off(struct ms912x_device *ms912x);
+int ms912x_detect_chip(struct ms912x_device *ms912x);
+int ms912x_hw_enable(struct ms912x_device *ms912x,
+		     const struct ms912x_mode *mode, u8 trans_mode);
+int ms912x_hw_start_video(struct ms912x_device *ms912x);
+int ms912x_hw_disable(struct ms912x_device *ms912x);
+void ms912x_stat_add(struct ms912x_stat *stat, u64 ns);
 
 int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
 			struct drm_format_conv_state *fmtcnv_state,
-			struct drm_rect *rect);
+			struct drm_rect *rect,
+			struct drm_pending_vblank_event **event);
+extern uint ms912x_keepalive_ms;
+extern bool ms912x_debug_hold;
+
+void ms912x_keepalive_work(struct work_struct *work);
+void ms912x_keepalive_arm(struct ms912x_device *ms912x);
+int ms912x_send_fill(struct ms912x_device *ms912x, unsigned int width,
+		     unsigned int height, u32 rgb, u64 *t_done_ns);
+void ms912x_send_event(struct ms912x_device *ms912x,
+		       struct drm_pending_vblank_event **event);
 
 void ms912x_free_request(struct ms912x_usb_request *request);
 int ms912x_init_request(struct ms912x_device *ms912x,

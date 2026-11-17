@@ -37,3 +37,43 @@ Driver is written by analyzing wireshark captures of the device.
 
 Run `sudo dkms install .`
 
+
+## Low-latency branch (`raul-lowlatency`)
+
+Changes on top of upstream, tested with an MS9133 (`345f:9133`) on Hyprland:
+
+- **Vendor mode-set sequence** (power/transfer/video ordering with delays,
+  HDMI unmute at `0xfb07`): without it the MS9133 accepts frames but never
+  drives the HDMI output.
+- **Keepalive**: the device turns its output off after ~3 s without frames
+  (the vendor driver resends every 2.5 s). The last transfer is resent after
+  `keepalive_ms` of idle time.
+- **`evdi_compat`**: reports the DRM driver name as `evdi` so Hyprland
+  (aquamarine) drives the render-less device by importing the iGPU's linear
+  buffers via PRIME (zero copy) instead of failing to create a renderer.
+- **Fast conversion**: AVX2 XRGB8888 -> UYVY read directly from the
+  framebuffer, split across threads (~1.7 ms per 1080p frame vs ~12.8 ms).
+- **Damage clips kept across buffer flips**: partial updates instead of a
+  full 4 MB frame for every change.
+- **Flip pacing** (`flip_mode=2`): the page flip completes just in time for
+  the next frame to be ready when the USB link frees up, so frames never queue
+  behind a transfer and go stale.
+
+Module options (`/sys/module/ms912x/parameters/`, or `options ms912x ...`
+in `/etc/modprobe.d/`): `flip_mode` (0/1/2), `keepalive_ms`, `conv_threads`,
+`use_avx2`, `trans_mode` (3 = double buffered, 5 = bypass; no measurable
+latency gain), `evdi_compat`, `debug_hold`.
+
+Debugfs (`/sys/kernel/debug/dri/<minor>/`): `ms912x_stats` (timings since
+the last read) and `ms912x_fill` (send a solid `RRGGBB` frame, for latency
+tests).
+
+Test and measurement scripts used for this work are in [`tools/`](tools/).
+
+Install with DKMS from a clean copy (the module then rebuilds on kernel updates):
+
+```sh
+sudo mkdir -p /usr/src/ms912x-0.2.0
+sudo cp Makefile dkms.conf LICENSE README.md *.c *.h /usr/src/ms912x-0.2.0/
+sudo dkms install ms912x/0.2.0
+```

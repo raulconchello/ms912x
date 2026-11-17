@@ -12,3 +12,5 @@ modules.order
 .project
 .settings
 .cache.mk
+tools/media/
+__pycache__/
