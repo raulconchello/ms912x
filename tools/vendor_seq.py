@@ -1,0 +1,16 @@
+import sys, time, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import msreg as m
+fd = os.open(m.find_dev(), os.O_RDWR)
+a6 = lambda sub, *d: m.feature(fd, [0xa6, sub] + list(d) + [0] * (6 - len(d)))
+a6(0x04, 0); a6(0x05, 0)
+v = m.read(fd, 0xfb07); m.write(fd, 0xfb07, v | 2)
+time.sleep(0.05)
+a6(0x07, 1, 2); time.sleep(0.05)
+a6(0x03, 3)
+a6(0x01, 0x07, 0x80, 0x04, 0x38, 0x22, 0x00)
+a6(0x02, 0x81, 0x01, 0x07, 0x80, 0x04, 0x38)
+a6(0x04, 1); time.sleep(0.3)
+a6(0x05, 1)
+v = m.read(fd, 0xfb07); m.write(fd, 0xfb07, v & ~2)
+print('done; fb07=%#x d003=%#x' % (m.read(fd, 0xfb07), m.read(fd, 0xd003)))
