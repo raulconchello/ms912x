@@ -490,9 +490,16 @@ int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
 	if (!drm_dev_enter(drm, &idx))
 		return -ENODEV;
 
-	/* Transfer buffer still in use, drop this frame. */
+	/*
+	 * Transfer buffer still in use, drop this frame. Unless the keepalive
+	 * is resending it: that is over within one transfer, and a dropped
+	 * frame would leave the output stale until the next update.
+	 */
 	if (!wait_for_completion_timeout(&current_request->done,
-					 msecs_to_jiffies(10))) {
+					 msecs_to_jiffies(10)) &&
+	    (!READ_ONCE(current_request->keepalive) ||
+	     !wait_for_completion_timeout(&current_request->done,
+					  msecs_to_jiffies(MS912X_KEEPALIVE_WAIT_MS)))) {
 		stats->dropped++;
 		ret = -ETIMEDOUT;
 		goto dev_exit;
@@ -562,9 +569,10 @@ void ms912x_keepalive_arm(struct ms912x_device *ms912x)
 
 /*
  * Runs on the ordered transfer workqueue, so it never overlaps a frame
- * transfer. The last request's buffer is only rewritten two frames later,
- * which cannot start before the next frame's transfer (queued behind this
- * work) has completed its flip.
+ * transfer. It claims the buffer like a new frame does, so that a frame
+ * converted into it meanwhile (only possible for commits that are not paced
+ * by flip events) waits for the resend instead of overwriting the buffer
+ * while it is being sent.
  */
 void ms912x_keepalive_work(struct work_struct *work)
 {
@@ -577,17 +585,29 @@ void ms912x_keepalive_work(struct work_struct *work)
 	if (!request || ms912x->video_pending || ms912x_debug_hold ||
 	    !ms912x_keepalive_ms)
 		return;
-	if (!drm_dev_enter(&ms912x->drm, &idx))
-		return;
 
+	/* A new frame holds the buffer and is about to be sent. */
+	if (!try_wait_for_completion(&request->done))
+		goto rearm;
+
+	if (!drm_dev_enter(&ms912x->drm, &idx)) {
+		complete(&request->done);
+		return;
+	}
+
+	WRITE_ONCE(request->keepalive, true);
 	ret = ms912x_request_send(request);
 	drm_dev_exit(idx);
+	complete(&request->done);
+	/* Cleared after complete() so a waiting frame never misses it. */
+	WRITE_ONCE(request->keepalive, false);
 
 	if (ret)
 		drm_dbg(&ms912x->drm, "keepalive failed: %d\n", ret);
 	else
 		ms912x->keepalives++;
 
+rearm:
 	ms912x_keepalive_arm(ms912x);
 }
 

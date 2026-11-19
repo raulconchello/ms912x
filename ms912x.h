@@ -32,6 +32,9 @@
 
 #define MS912X_BULK_OUT_ENDPOINT	4
 
+/* Longest a new frame waits for a keepalive resend of its buffer */
+#define MS912X_KEEPALIVE_WAIT_MS	500
+
 #define MS912X_REQ_TYPE_WRITE_6_BYTES	0xa6
 #define MS912X_REQ_TYPE_READ_BYTE	0xb5
 #define MS912X_REQ_TYPE_WRITE_BYTE	0xb6
@@ -99,6 +102,7 @@ struct ms912x_usb_request {
 	struct work_struct work;
 	struct timer_list timer;
 	struct completion done;
+	bool keepalive; /* being resent by the keepalive */
 };
 
 struct ms912x_mode {
